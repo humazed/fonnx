@@ -76,7 +76,7 @@ self.onmessage = async e => {
             const cTensor = new ort.Tensor('float32', c, [2, 1, 64]);
 
             // Prepare tensors and run the inference session
-            const audioBytesFloat32 = new convertAudioBytesToFloats(audioBytes);
+            const audioBytesFloat32 = convertAudioBytesToFloats(audioBytes);
             const shape = [1, audioBytesFloat32.length];
             const audioStreamTensor = new ort.Tensor('float32', audioBytesFloat32, shape);
             const sampleRateTensor = new ort.Tensor('int64', [16000], [1]);

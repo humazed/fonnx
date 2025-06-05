@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:fonnx_example/padding.dart';
 import 'dart:async';
 import 'package:path_provider/path_provider.dart' as path_provider;
 import 'package:path/path.dart' as path;
+import 'package:record/record.dart';
 
 class SileroVadWidget extends StatefulWidget {
   const SileroVadWidget({super.key});
@@ -19,6 +21,19 @@ class SileroVadWidget extends StatefulWidget {
 class _SileroVadWidgetState extends State<SileroVadWidget> {
   bool? _verifyPassed;
   String? _speedTestResult;
+
+  // ===== Live VAD demo state =====
+  bool _isLiveDemoRunning = false;
+  double? _currentVadP; // Latest VAD probability (0..1)
+  bool _speechDetected = false;
+  bool _speechDetectedLast5s = false;
+  StreamSubscription<Uint8List>? _micSub;
+  AudioRecorder? _audioRecorder;
+  SileroVad? _liveVad;
+  final List<int> _micBuffer = [];
+  Map<String, dynamic> _lastVadState = {};
+  final List<_VadSample> _recentVad = [];
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -68,8 +83,81 @@ class _SileroVadWidgetState extends State<SileroVadWidget> {
               ),
           ],
         ),
-    
+        heightPadding,
+        _buildLiveDemoSection(context),
       ],
+    );
+  }
+
+  Widget _buildLiveDemoSection(BuildContext context) {
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _toggleLiveDemo,
+                  icon:
+                      Icon(_isLiveDemoRunning ? Icons.stop : Icons.play_arrow),
+                  label: Text(_isLiveDemoRunning
+                      ? 'Stop Live Demo'
+                      : 'Start Live Demo'),
+                ),
+                const SizedBox(width: 12),
+                if (_isLiveDemoRunning)
+                  Row(
+                    children: [
+                      Icon(
+                        _speechDetected ? Icons.mic : Icons.mic_off,
+                        color: _speechDetected ? Colors.red : Colors.grey,
+                        size: 28,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _speechDetected ? 'Speech' : 'Silence',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ],
+                  ),
+              ],
+            ),
+            if (_isLiveDemoRunning) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                minHeight: 8,
+                value: _currentVadP?.clamp(0.0, 1.0) ?? 0.0,
+                backgroundColor: Colors.grey.shade300,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  _speechDetected ? Colors.red : Colors.grey,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                  'VAD probability: ${_currentVadP != null ? _currentVadP!.toStringAsFixed(2) : '--'}'),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Icon(
+                      _speechDetectedLast5s
+                          ? Icons.graphic_eq
+                          : Icons.hearing_disabled,
+                      color:
+                          _speechDetectedLast5s ? Colors.green : Colors.grey),
+                  const SizedBox(width: 8),
+                  Text(_speechDetectedLast5s
+                      ? 'Speech present in last 5 seconds'
+                      : 'No speech in last 5 seconds'),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
@@ -177,4 +265,112 @@ class _SileroVadWidgetState extends State<SileroVadWidget> {
 
     return modelPath;
   }
+
+  // ================= Live demo logic =================
+  static const int _sampleRate = 16000;
+  static const int _channels = 1;
+  static const int _bitsPerSample = 16; // pcm16
+  static const int _frameMs = 30;
+  static final int _frameSizeBytes =
+      _sampleRate * _frameMs * _channels * (_bitsPerSample ~/ 8) ~/ 1000;
+
+  Future<void> _toggleLiveDemo() async {
+    if (_isLiveDemoRunning) {
+      await _stopLiveDemo();
+    } else {
+      await _startLiveDemo();
+    }
+  }
+
+  Future<void> _startLiveDemo() async {
+    final hasPermission = await AudioRecorder().hasPermission();
+    if (!hasPermission) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Microphone permission denied')),
+      );
+      return;
+    }
+
+    final modelPath = await getModelPath('silero_vad.onnx');
+    _liveVad = SileroVad.load(modelPath);
+
+    _audioRecorder = AudioRecorder();
+    final stream = await _audioRecorder!.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        numChannels: _channels,
+        sampleRate: _sampleRate,
+        echoCancel: false,
+        noiseSuppress: false,
+      ),
+    );
+
+    _isLiveDemoRunning = true;
+    setState(() {});
+
+    _micSub = stream.listen((event) async {
+      _micBuffer.addAll(event);
+      while (_micBuffer.length >= _frameSizeBytes) {
+        final frameBytes =
+            Uint8List.fromList(_micBuffer.sublist(0, _frameSizeBytes));
+        _micBuffer.removeRange(0, _frameSizeBytes);
+
+        if (_liveVad == null) continue;
+        final nextState = await _liveVad!
+            .doInference(frameBytes, previousState: _lastVadState);
+        _lastVadState = nextState;
+        final p = (nextState['output'] as Float32List).first;
+
+        // Maintain 5-second rolling history
+        _recentVad.add(_VadSample(p));
+        final cutoff = DateTime.now().subtract(const Duration(seconds: 5));
+        while (_recentVad.isNotEmpty && _recentVad.first.ts.isBefore(cutoff)) {
+          _recentVad.removeAt(0);
+        }
+        _speechDetectedLast5s = _recentVad.any((s) => s.p >= 0.5);
+
+        setState(() {
+          _currentVadP = p;
+          _speechDetected = p >= 0.5;
+        });
+      }
+    });
+  }
+
+  Future<void> _stopLiveDemo() async {
+    _isLiveDemoRunning = false;
+    _currentVadP = null;
+    _speechDetected = false;
+    _speechDetectedLast5s = false;
+    _lastVadState = {};
+    _micBuffer.clear();
+    await _micSub?.cancel();
+    _micSub = null;
+    if (_audioRecorder != null) {
+      if (await _audioRecorder!.isRecording()) {
+        await _audioRecorder!.stop();
+      }
+      _audioRecorder = null;
+    }
+    _liveVad = null;
+    _recentVad.clear();
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    _stopLiveDemo();
+    super.dispose();
+  }
+}
+
+// Holder for VAD probability with timestamp
+class _VadSample {
+  final double p;
+  final DateTime ts;
+
+  _VadSample(this.p) : ts = DateTime.now();
 }

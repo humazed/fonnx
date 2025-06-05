@@ -1,0 +1,2 @@
+/Users/ibrahimeid/Developer/AS/ASP/OpenSource/fonnx/example/android/app/.cxx/Debug/6ew11g44/x86/CMakeFiles/edit_cache.dir
+/Users/ibrahimeid/Developer/AS/ASP/OpenSource/fonnx/example/android/app/.cxx/Debug/6ew11g44/x86/CMakeFiles/rebuild_cache.dir
